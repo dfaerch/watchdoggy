@@ -3,7 +3,6 @@
 use strict;
 use warnings;
 use Getopt::Std;
-use Data::Dumper;
 
 my %opts;
 my %config = (
