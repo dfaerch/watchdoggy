@@ -26,7 +26,7 @@ Usage:
     -c      Count - How many times watch-command must fail before running Action (default=$config{count})
     -a      Action - The command to run when something is deemed to be down.
     -b      Back-off - The number of seconds after executing Action, before it is allowed to do so again. (default=$config{backoff})
-    -v      Output versbosity. 0=silent, 1=normal output, 10=debug
+    -v      Output verbosity. 0=silent, 1=normal output, 10=debug
 
 Examples:
     This example runs "apachectl status" every 10 seconds.
