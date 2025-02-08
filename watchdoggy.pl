@@ -3,122 +3,185 @@
 use strict;
 use warnings;
 use Getopt::Std;
+use IPC::Open3;
+use Symbol 'gensym';
+use IO::Select;
 
 my %opts;
+getopts('w:i:c:a:b:s:v:e:', \%opts);
 my %config = (
-    interval => 30,
-    count    => 4,
-    backoff  => 14400,
-    watch    => undef,
-    action   => undef,
-    verbose  => 1
+    interval    => 30,
+    count       => 4,
+    backoff     => 14400,
+    watch       => undef,
+    action      => undef,
+    verbose     => 1,
+    stdin_lines => undef,  # Max number of lines to buffer from STDIN
+    expected_ok => 0,      # Expected exit code for "all good"
 );
 
-sub usage {
-    my $err = shift;
-    print "$err\n" if (defined $err);
-
-    print <<EOD
-Usage:
-    -w      Watch-command - This command is run on Interval (-i) and must return zero exitcode or be deemed "down".
-    -i      Interval - How often to run the Watch-command. (default=$config{interval})
-    -c      Count - How many times watch-command must fail before running Action (default=$config{count})
-    -a      Action - The command to run when something is deemed to be down.
-    -b      Back-off - The number of seconds after executing Action, before it is allowed to do so again. (default=$config{backoff})
-    -v      Output verbosity. 0=silent, 1=normal output, 10=debug
-
-Examples:
-    This example runs "apachectl status" every 10 seconds.
-    If it returns non-zero exit code 5 times in a row, then we run "apachectl restart".
-    Finally, we backoff of 600 seconds (10 minutes), before it will try to do "apachectl restart" again.
-
-    \$ ./watchdoggy.pl -i 10 -c 5 -b 600  -w "apachectl status" -a "apachectl restart"
-
-
-    --
-
-    Detect if the kernel.org doesnt contain the word "Kernel" and send a mail if that happens.
-    \$ ./watchdoggy.pl -i 600 -c 3 -w "curl https://www.kernel.org | grep Kernel" -a "echo 'Kernel.org looks wrong.' | mail alert\@example.com"
-
-    --
-
-    Wait for a local backup to complete, then shutdown machine.
-    The "find" in the example, lists files modified within the last 2 minutes, and grep matches anything. Grep will return non-zero exit code, 
-    if nothing was listed. Thus, when nothing has been modified for a while in the backup folder, we will shutdown.
-
-    \$ ./watchdoggy.pl -i 5 -c 5 -w "find /home/backups/  -mmin -2 | grep . " -a "shutdown now"
-
-Notes:
-    Count will reset after Action runs. Thus a Back-off of 0 will result in Action being run every Interval*Count seconds, as long as watch command fails.
-
-EOD
-;
-
-    exit 1;
-}
-
-getopts('w:i:c:a:b:', \%opts);
 $config{watch}    = $opts{w} if defined $opts{w};
 $config{interval} = $opts{i} if defined $opts{i};
 $config{backoff}  = $opts{b} if defined $opts{b};
 $config{count}    = $opts{c} if defined $opts{c};
 $config{action}   = $opts{a} if defined $opts{a};
 $config{verbose}  = $opts{v} if defined $opts{v};
+$config{stdin_lines} = $opts{s} if defined $opts{s};
+$config{expected_ok} = $opts{e} if defined $opts{e};
 
-usage("Interval is invalid")            unless defined $config{interval} and $config{interval} > 0;
-usage("Count is invalid")               unless defined $config{count}    and $config{count}    > 0;
-usage("Watch-command must be defined")  unless defined $config{watch};
-usage("Action must be defined")         unless defined $config{action};
+sub usage {
+    my $err = shift;
+    print "$err\n" if defined $err;
+    print <<'EOD';
+Usage:
+    -w      Watch-command. This command is run every Interval seconds and must return an OK exit code (see -e).
+    -i      Interval - seconds between watch-command executions (default=30).
+    -c      Count - number of consecutive failures before running Action (default=4).
+    -a      Action - command to run when watch-command fails sufficiently.
+    -b      Back-off - seconds to wait after running Action (default=14400).
+    -s      STDIN mode - if defined, we read from STDIN, maintaining a buffer of at most n lines. Watch-command
+            is run over this buffer only. And only at -i interval.
+    -e      Expected OK exit code - The exit code that indicates everything is fine (default=0).
+    -v      Verbosity - 0=silent, 1=normal, 10=debug.
 
-sub dolog($$) {
-    my $loglevel = shift;
-    return unless $config{verbose} >= $loglevel; 
-    print shift."\n";
+
+
+Examples:
+
+    First example runs "apachectl status" every 10 seconds.
+    If it returns non-zero exit code 5 times in a row, then we run "apachectl restart".
+    Finally, we backoff of 600 seconds (10 minutes), before it will try to do "apachectl restart" again.
+      $ ./watchdoggy.pl -i 10 -c 5 -b 600 -w "apachectl status" -a "apachectl restart"
+
+    Pipe a live logfile in, keeping only the last 100 lines of input in buffer. Ever 10 seconds, grep that buffer for "ERROR".
+    grep exit 1 if not found, so we define -e 1, meaning, if ERROR was not found in buffer, it doesnt count. 
+      $ tail -f logfile | ./watchdoggy.pl -s 100 -i 10 -c 5 -b 600 -w -e 1 "grep -q 'ERROR'" -a "systemctl restart myservice"
+
+    Monitor stdout inside a Docker or Podman container for something spefic and take action based on it.
+      $ tail -f /proc/1/fd/1 | /watchdoggy.pl -s 10 -i 60 -c 2 -b 600  
+
+
+    Note: You do not get realtime reaction to stdin. This tool is explicitly made for the opposite: Analysing a smaller sample
+    of data, at a defined interval and take an action if enough matches are made.
+
+EOD
+    exit 1;
 }
 
-my $count = 0;
+usage("Interval is invalid")           unless defined $config{interval} and $config{interval} > 0;
+usage("Count is invalid")              unless defined $config{count}    and $config{count}    > 0;
+usage("Watch-command must be defined") unless defined $config{watch};
+usage("Action must be defined")        unless defined $config{action};
+
+sub dolog($$) {
+    my ($level, $msg) = @_;
+    print "$msg\n" if $config{verbose} >= $level;
+}
+
+sub run_watch_with_stdin {
+    my ($cmd, $buffer_ref) = @_;
+    my $err = gensym;
+    my $pid = open3(my $child_in, my $child_out, $err, $cmd);
+
+    # Ensure command always gets input
+    if (@$buffer_ref) {
+        print $child_in $_ for @$buffer_ref;
+    } else {
+        print $child_in "\n";  # Prevent failure due to empty input
+    }
+
+    close $child_in;
+    my $output = do { local $/; <$child_out> };
+    close $child_out;
+    waitpid($pid, 0);
+    my $exit_code = $? >> 8;
+    return ($output, $exit_code);
+}
+
+my $count   = 0;
 my $backoff = 0;
-while (1) {
 
+if (defined $config{stdin_lines}) {
+    my @buffer;
+    my $sel = IO::Select->new();
+    $sel->add(\*STDIN);
+    my $time_counter = 0;
 
-    # config-count * config-interval = the time needed to determine if we need to run Action.
-    # So theres is no need to execute the Watch-command before that time.
-    if ($backoff < ($config{count} * $config{interval} )) {
+    while (1) {
+        while (my @ready = $sel->can_read(0)) {
+            my $line = <STDIN>;
+            last unless defined $line;
+            push @buffer, $line;
+            shift @buffer while scalar(@buffer) > $config{stdin_lines};
+        }
 
-        my $watch_res = `$config{watch}`;
-        if ($? != 0) {
-
-            $count++;
-            dolog(1,"Watch-command returned non-zero exit code");
-
-            if ($count >= $config{count}) {
-                dolog(10,"Failed $count times");
-
-                unless ($backoff) {
-                    my $action_res = `$config{action}`;
-                    dolog(1,"Running action. Output: $action_res");
-
+        if ($backoff) {
+            dolog(10, "Backing off for $backoff more seconds");
+            $backoff--;
+        }
+        else {
+            $time_counter++;
+            if ($time_counter >= $config{interval}) {
+                $time_counter = 0;
+                my ($watch_res, $watch_exit) = run_watch_with_stdin($config{watch}, \@buffer);
+                
+                if ($watch_exit != $config{expected_ok}) {
+                    $count++;
+                    dolog(1, "Watch-command returned unexpected exit code: $watch_exit (Expected: $config{expected_ok})");
+                    if ($count >= $config{count}) {
+                        dolog(10, "Failed $count times");
+                        unless ($backoff) {
+                            my $action_res = `$config{action}`;
+                            dolog(1, "Running action. Output: $action_res");
+                            $count = 0;
+                            if ($config{backoff}) {
+                                $backoff = $config{backoff};
+                                dolog(1, "Backing off for $backoff seconds");
+                            }
+                        }
+                    }
+                }
+                else {
                     $count = 0;
+                }
+            }
+        }
+        sleep 1;
+    }
+}
+else {
+    while (1) {
+        if ($backoff < ($config{count} * $config{interval})) {
+            my $watch_res = `$config{watch}`;
+            my $watch_exit = $? >> 8;
 
-                    if (defined $config{backoff} && $config{backoff}) {
-                        $backoff = $config{backoff};
-                        dolog(1,"Backing off for $backoff seconds");
+            if ($watch_exit != $config{expected_ok}) {
+                $count++;
+                dolog(1, "Watch-command returned unexpected exit code: $watch_exit (Expected: $config{expected_ok})");
+                if ($count >= $config{count}) {
+                    dolog(10, "Failed $count times");
+                    unless ($backoff) {
+                        my $action_res = `$config{action}`;
+                        dolog(1, "Running action. Output: $action_res");
+                        $count = 0;
+                        if ($config{backoff}) {
+                            $backoff = $config{backoff};
+                            dolog(1, "Backing off for $backoff seconds");
+                        }
                     }
                 }
             }
-
-        } else {
-            # Everthing was OK.
-            $count = 0;
+            else {
+                $count = 0;
+            }
         }
-
-    }
-
-    if ($backoff) {
-        dolog(10,"Backing off for $backoff more seconds");
-        $backoff--;
-        sleep 1;
-    } else {
-        sleep $config{interval};
+        if ($backoff) {
+            dolog(10, "Backing off for $backoff more seconds");
+            $backoff--;
+            sleep 1;
+        }
+        else {
+            sleep $config{interval};
+        }
     }
 }
